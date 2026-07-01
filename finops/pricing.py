@@ -60,21 +60,100 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+# Illustrative per-hour spot interruption probability by GPU family (deck: newer
+# flagship parts get preempted less than commodity/consumer-adjacent cards because
+# clouds keep more flagship spot capacity in reserve).
+DEFAULT_INTERRUPT_RATES = {
+    "H100": 0.02, "H200": 0.02, "B200": 0.015, "A100": 0.04,
+    "A10G": 0.08, "L4": 0.06, "MI300X": 0.05,
+}
+
+
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: int | None = None,
+    reserved_discount_1yr: float | None = None,
+    interrupt_rate_by_gpu: dict | None = None,
+    max_acceptable_interrupt_rate: float = 0.10,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
     DOCUMENTED simple policy (instructor extension point — swap in your own):
       - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
       - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
       - otherwise                 -> 'on_demand' (spiky / low duty)
+
+    Extension 1 (Your Turn): when `gpu_type` is given, spot is only recommended
+    if that GPU family's interruption rate clears `max_acceptable_interrupt_rate`
+    — a workload that "can" checkpoint still shouldn't ride a spot pool that gets
+    reclaimed too often (rework cost eats the discount, see spot_checkpoint_cost).
+    When `job_days` and `reserved_discount_1yr` are both given, short-lived jobs
+    (< 365 days) are matched against a *1-year* reserved break-even instead of the
+    3-year one, since committing 3 years of discount to a 60-day job is a bad trade.
+    Both extensions are no-ops (identical to the original policy) unless their
+    extra arguments are supplied, so existing callers/tests are unaffected.
     """
     duty = max(0.0, hours_per_day) / 24.0
-    be = break_even_utilization(reserved_discount)
+    be_3yr = break_even_utilization(reserved_discount)
+
     if interruptible and hours_per_day < 24:
-        return "spot"
-    if duty >= be:
+        rates = interrupt_rate_by_gpu or DEFAULT_INTERRUPT_RATES
+        rate = rates.get(gpu_type, 0.05)
+        if rate <= max_acceptable_interrupt_rate:
+            return "spot"
+        # else: this GPU family gets reclaimed too often — fall through and
+        # size the commitment on duty cycle instead of chasing the spot discount.
+
+    if job_days is not None and reserved_discount_1yr is not None:
+        be_1yr = break_even_utilization(reserved_discount_1yr)
+        if job_days < 365:
+            return "reserved_1yr" if duty >= be_1yr else "on_demand"
+        if duty >= be_3yr:
+            return "reserved_3yr"
+        if duty >= be_1yr:
+            return "reserved_1yr"
+        return "on_demand"
+
+    if duty >= be_3yr:
         return "reserved"
     return "on_demand"
+
+
+def cache_breakeven_reads(
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    price_in_per_m: float = 1.0,
+) -> float:
+    """Minimum re-reads of a cached prefix needed to offset its write cost.
+
+    Each read saves `price_in_per_m * (1 - read_discount)` per 1M tokens vs.
+    paying full input price again; the write is a one-time `write_cost_per_m`.
+    """
+    savings_per_read = price_in_per_m * (1.0 - read_discount)
+    if savings_per_read <= 0:
+        return float("inf")
+    return write_cost_per_m / savings_per_read
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+    price_in_per_m: float = 1.0,
+) -> bool:
+    """Extension 3 (Your Turn): prompt caching only saves money once a cached
+    prefix is re-read enough times to pay back its write cost.
+
+    Providers that bill a cache *write* (e.g. an up-front indexing charge) make
+    caching a bad trade for prefixes that are only read once or twice — the write
+    premium can exceed the read discount. True iff `avg_cache_reads` clears the
+    break-even point from `cache_breakeven_reads`.
+    """
+    breakeven = cache_breakeven_reads(write_cost_per_m, read_discount, price_in_per_m)
+    return avg_cache_reads > breakeven
 
 
 def spot_checkpoint_cost(
